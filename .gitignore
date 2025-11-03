@@ -1,0 +1,8 @@
+venv/
+evaluations/
+recordings/
+evaluations/
+transcriptions/
+.env
+*.json
+__pycache__/

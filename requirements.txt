@@ -1,0 +1,16 @@
+livekit
+livekit-agents
+livekit-api
+livekit-plugins-deepgram
+livekit-plugins-google
+livekit-plugins-openai
+livekit-plugins-silero
+dotenv
+requests
+pyshorteners
+opencv-python
+numpy
+av
+livekit-agents[google]
+google-generativeai
+
