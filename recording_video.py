@@ -19,13 +19,13 @@ except Exception:
 
 @dataclass
 class VideoFrameItem:
-    pts_us: int
+    pts_us: int  # Timestamp in microseconds from LiveKit
     frame: rtc.VideoFrame
 
 
 @dataclass
 class AudioFrameItem:
-    pts_samples: int
+    pts_us: int  # Timestamp in microseconds (synchronized with video)
     frame: rtc.AudioFrame
 
 
@@ -57,15 +57,19 @@ class ParticipantVideoRecorder:
         self._video_q: asyncio.Queue[VideoFrameItem] = asyncio.Queue(maxsize=120)
         self._audio_q: asyncio.Queue[AudioFrameItem] = asyncio.Queue(maxsize=240)
 
-        # Audio clock tracking
-        self._audio_pts_samples: int = 0
+        # Synchronization: use microseconds as common timebase
+        self._segment_start_us: int = 0  # Segment start time in microseconds
         
-        # Video PTS tracking (frame count)
-        self._video_pts_frame: int = 0
+        # Frame counters as fallback if timestamps are invalid
+        self._video_frame_count: int = 0
+        self._audio_sample_count: int = 0
 
         # Control
         self._stop_event = asyncio.Event()
         self._rotate_now: bool = False
+
+        # Audio resampler for encoder (set when opening container if audio present)
+        self._audio_resampler: Optional[av.audio.resampler.AudioResampler] = None
 
     async def start_if_ready(self) -> None:
         print(f"[RECORDER] start_if_ready called for {self.participant.identity or self.participant.sid}")
@@ -130,12 +134,40 @@ class ParticipantVideoRecorder:
                 if self._stop_event.is_set():
                     break
                 af = event.frame
-                pts = self._audio_pts_samples
-                self._audio_pts_samples += af.num_samples
-                await self._audio_q.put(AudioFrameItem(pts_samples=pts, frame=af))
+                # Get timestamp from event (microseconds) - same as video uses
+                pts_us = getattr(event, "timestamp_us", None)
+                if pts_us is None:
+                    pts_us = int(time.time() * 1_000_000)
+                
+                # Derive channels and sample rate robustly
+                channels = getattr(af, "num_channels", getattr(af, "channels", 1))
+                sample_rate = getattr(af, "sample_rate", 48000)
+                raw = getattr(af, "data", b"")
+                # Each sample is int16 (2 bytes) per channel
+                try:
+                    samples_interleaved = len(raw) // 2
+                    num_samples_total = max(0, samples_interleaved)
+                    if channels > 0:
+                        num_samples_per_channel = num_samples_total // channels
+                    else:
+                        channels = 1
+                        num_samples_per_channel = num_samples_total
+                except Exception:
+                    channels = max(1, int(getattr(af, "num_channels", 1)))
+                    num_samples_per_channel = int(getattr(af, "num_samples", getattr(af, "samples_per_channel", 0)))
+
+                # Stash derived metadata on the frame for the writer
+                try:
+                    af._derived_channels = channels  # type: ignore[attr-defined]
+                    af._derived_sample_rate = sample_rate  # type: ignore[attr-defined]
+                    af._derived_num_samples = num_samples_per_channel  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                await self._audio_q.put(AudioFrameItem(pts_us=pts_us, frame=af))
                 frame_count += 1
                 if frame_count % 100 == 0:  # Log every 100 frames
-                    print(f"[RECORDER] Audio reader: collected {frame_count} audio frames")
+                    print(f"[RECORDER] Audio reader: collected {frame_count} frames (ch={channels}, sr={sample_rate}, samples/frame={num_samples_per_channel})")
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -157,10 +189,11 @@ class ParticipantVideoRecorder:
         container, v_stream, a_stream, current_path, native_path = self._open_container(segment_start)
         print(f"[RECORDER] Opened new segment file: {native_path}")
         
-        # Reset PTS counters for new segment
-        self._video_pts_frame = 0
-        self._audio_pts_samples = 0
+        # Set segment start time in microseconds for synchronization
+        self._segment_start_us = int(segment_start * 1_000_000)
         self._audio_frames_written = 0  # Track audio frames written to container
+        self._video_frame_count = 0  # Reset frame counter
+        self._audio_sample_count = 0  # Reset audio sample counter
 
         last_heartbeat = time.time()
         try:
@@ -198,10 +231,12 @@ class ParticipantVideoRecorder:
                         segment_start = now
                         container, v_stream, a_stream, current_path, native_path = self._open_container(segment_start)
                         print(f"[RECORDER] Rotated segment. New file: {native_path}")
-                        # Reset PTS for new segment
-                        self._video_pts_frame = 0
-                        self._audio_pts_samples = 0
+                        # Reset for new segment
+                        self._segment_start_us = int(segment_start * 1_000_000)
                         self._audio_frames_written = 0
+                        self._video_frame_count = 0
+                        self._audio_sample_count = 0
+                        self._audio_resampler = None
                         self._rotate_now = False
                     except Exception as e:
                         print(f"[ERROR] Error during segment rotation: {e}")
@@ -212,8 +247,11 @@ class ParticipantVideoRecorder:
                             segment_start = now
                             container, v_stream, a_stream, current_path, native_path = self._open_container(segment_start)
                             print(f"[RECORDER] Recovered - opened new container: {native_path}")
-                            self._video_pts_frame = 0
-                            self._audio_pts_samples = 0
+                            self._segment_start_us = int(segment_start * 1_000_000)
+                            self._audio_frames_written = 0
+                            self._video_frame_count = 0
+                            self._audio_sample_count = 0
+                            self._audio_resampler = None
                             self._rotate_now = False
                         except Exception as e2:
                             print(f"[ERROR] Failed to recover from rotation error: {e2}")
@@ -292,8 +330,20 @@ class ParticipantVideoRecorder:
         a_stream = None
         has_audio = self.audio_stream is not None
         if has_audio:
-            # Configure audio encoder; sample rate is set via rate. Channel layout will be derived from frames.
+            # Configure audio encoder (AAC). We'll feed it FLTP mono @ 48k via resampler.
             a_stream = container.add_stream("aac", rate=48000)
+            try:
+                # Some builds support setting time_base explicitly
+                a_stream.time_base = Fraction(1, 48000)
+            except Exception:
+                pass
+            # Create a resampler to convert incoming s16 mono to fltp mono @ 48k
+            try:
+                self._audio_resampler = av.AudioResampler(format="fltp", layout="mono", rate=48000)
+                print(f"[RECORDER] Audio resampler initialized: fltp/mono/48000")
+            except Exception as e:
+                self._audio_resampler = None
+                print(f"[RECORDER] Warning: failed to initialize audio resampler: {e}")
             print(f"[RECORDER] Container opened WITH audio stream for {os.path.basename(native_path)}")
         else:
             print(f"[RECORDER] Container opened WITHOUT audio stream for {os.path.basename(native_path)} (audio_stream is None)")
@@ -318,11 +368,39 @@ class ParticipantVideoRecorder:
 
             av_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             av_frame = av_frame.reformat(format="yuv420p")
-            # Use frame-based PTS (increment for each frame)
-            av_frame.pts = self._video_pts_frame
-            self._video_pts_frame += 1
-            for packet in v_stream.encode(av_frame):
-                container.mux(packet)
+            
+            # Convert microseconds timestamp to stream timebase (30 fps = 1/30)
+            # Use frame counter as fallback if timestamp is invalid
+            try:
+                relative_time_us = item.pts_us - self._segment_start_us
+                if relative_time_us >= 0:
+                    av_frame.pts = int((relative_time_us / 1_000_000) * 30)
+                else:
+                    # Timestamp before segment start - use frame counter
+                    av_frame.pts = self._video_frame_count
+            except Exception:
+                # Fallback to frame counter
+                av_frame.pts = self._video_frame_count
+            
+            # Ensure PTS is non-negative
+            if av_frame.pts < 0:
+                av_frame.pts = self._video_frame_count
+            
+            self._video_frame_count += 1
+            
+            try:
+                for packet in v_stream.encode(av_frame):
+                    if packet is None:
+                        continue
+                    # Validate packet PTS
+                    if packet.pts is not None and packet.pts < 0:
+                        print(f"[WARNING] Skipping video packet with negative PTS: {packet.pts}")
+                        continue
+                    container.mux(packet)
+            except Exception as encode_error:
+                print(f"[ERROR] Failed to encode/mux video packet: {encode_error}")
+                import traceback
+                traceback.print_exc()
         except Exception as e:
             print(f"Error writing video frame: {e}")
             import traceback
@@ -334,13 +412,124 @@ class ParticipantVideoRecorder:
                 print(f"[WARNING] Received audio frame but a_stream is None - audio not included in container")
                 return
             af = item.frame
-            samples = np.frombuffer(af.data, dtype=np.int16).reshape((af.num_samples, af.num_channels))
-            av_frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
-            av_frame.sample_rate = af.sample_rate
-            av_frame.pts = item.pts_samples
-            av_frame.time_base = Fraction(1, af.sample_rate)
-            for packet in a_stream.encode(av_frame):
-                container.mux(packet)
+            raw = getattr(af, "data", b"")
+            channels = getattr(af, "_derived_channels", getattr(af, "num_channels", getattr(af, "channels", 1)))
+            sample_rate = getattr(af, "_derived_sample_rate", getattr(af, "sample_rate", 48000))
+            num_samples = getattr(af, "_derived_num_samples", getattr(af, "num_samples", getattr(af, "samples_per_channel", 0)))
+            if channels <= 0:
+                channels = 1
+            if num_samples <= 0 and len(raw) > 0:
+                num_samples = (len(raw) // 2) // channels
+            
+            # Build ndarray - PyAV expects packed format (channels, num_samples)
+            # LiveKit provides interleaved format: [L,R,L,R,...] or [S,S,S,...]
+            try:
+                arr = np.frombuffer(raw, dtype=np.int16)
+                total_samples = len(arr)
+                
+                if channels > 1:
+                    # Interleaved: reshape to (num_samples, channels) then transpose to (channels, num_samples)
+                    num_samples = total_samples // channels
+                    arr = arr.reshape((num_samples, channels)).T  # (channels, num_samples)
+                    # Downmix to mono to match stream settings
+                    arr = arr[:1, :]  # take first channel
+                    channels = 1
+                else:
+                    # Mono: reshape to (1, num_samples) for packed format
+                    num_samples = total_samples
+                    arr = arr.reshape((1, num_samples))  # (1, num_samples)
+                    
+            except Exception as e:
+                print(f"[RECORDER] Failed to reshape audio buffer (len={len(raw)}, ch={channels}): {e}")
+                return
+
+            layout = "mono"  # we encode mono consistently
+            
+            # Ensure sample rate matches stream (48kHz)
+            target_sample_rate = 48000
+            needs_resample = int(sample_rate) != target_sample_rate
+            
+            if needs_resample:
+                # Need to resample - use resampler if available
+                if self._audio_resampler is None:
+                    print(f"[WARNING] Sample rate mismatch ({sample_rate} != {target_sample_rate}) but no resampler available")
+                    return
+            else:
+                # If already at 48kHz, we still need to convert format (s16 -> fltp) for AAC
+                # But let's try encoding s16 directly first - some AAC encoders accept it
+                pass
+            
+            # Calculate samples in this frame
+            num_samples = getattr(af, "_derived_num_samples", 0)
+            if num_samples <= 0:
+                num_samples = (len(raw) // 2) // channels if channels > 0 else len(raw) // 2
+            
+            in_frame = av.AudioFrame.from_ndarray(arr, format="s16", layout=layout)
+            in_frame.sample_rate = int(sample_rate)
+            # Use sample counter for PTS (monotonically increasing)
+            # This ensures packets are always in order
+            in_frame.pts = self._audio_sample_count
+            in_frame.time_base = Fraction(1, int(sample_rate))
+            
+            # Increment counter AFTER setting PTS
+            self._audio_sample_count += num_samples
+
+            # Resample to AAC-preferred format (fltp mono 48k) if needed
+            if needs_resample and self._audio_resampler is not None:
+                try:
+                    out_frames = self._audio_resampler.resample(in_frame)
+                    if not out_frames:
+                        print(f"[WARNING] Resampler returned no frames")
+                        return
+                except Exception as e:
+                    print(f"[RECORDER] Resample failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return
+            else:
+                # Use input frame directly if already at correct rate and format
+                # Note: AAC prefers fltp, but s16 might work with some encoders
+                out_frames = [in_frame]
+                # If we have a resampler and want fltp format, use it even at same rate
+                if self._audio_resampler is not None and in_frame.format.name != "fltp":
+                    try:
+                        # Resample to convert format (s16 -> fltp) at same rate
+                        out_frames = self._audio_resampler.resample(in_frame)
+                        if not out_frames:
+                            out_frames = [in_frame]  # Fallback to original
+                    except Exception:
+                        out_frames = [in_frame]  # Fallback to original
+
+            for out in out_frames:
+                # Ensure output frame has correct properties
+                # Convert input sample count (at input rate) to target rate (48kHz)
+                # Use the base PTS before increment
+                base_sample_count = self._audio_sample_count - num_samples
+                audio_pts_samples = int((base_sample_count * target_sample_rate) / int(sample_rate))
+                
+                # Ensure non-negative
+                if audio_pts_samples < 0:
+                    audio_pts_samples = 0
+                    
+                out.pts = audio_pts_samples
+                out.time_base = Fraction(1, target_sample_rate)
+                out.sample_rate = target_sample_rate
+                
+                try:
+                    for packet in a_stream.encode(out):
+                        if packet is None:
+                            continue
+                        # Validate packet
+                        if packet.pts is not None and packet.pts < 0:
+                            print(f"[WARNING] Skipping packet with negative PTS: {packet.pts}")
+                            continue
+                        container.mux(packet)
+                except Exception as encode_error:
+                    print(f"[ERROR] Failed to encode/mux audio packet: {encode_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Continue with next frame instead of breaking
+                    continue
             self._audio_frames_written += 1
             if self._audio_frames_written % 500 == 0:  # Log every 500 frames
                 print(f"[RECORDER] Written {self._audio_frames_written} audio frames to container")
