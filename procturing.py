@@ -416,8 +416,16 @@ class Procturing:
             av_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             av_frame = av_frame.reformat(format="yuv420p")
             
-            # Use simple frame counter for PTS (monotonically increasing)
-            av_frame.pts = self._video_frame_count
+            # Use timestamp_us relative to segment start for proper synchronization
+            # Convert microseconds to video PTS (30 fps = 1/30 timebase)
+            relative_time_us = item.pts_us - self._segment_start_us
+            if relative_time_us >= 0:
+                # Convert microseconds to seconds, then to frame number at 30fps
+                av_frame.pts = int((relative_time_us / 1_000_000) * 30)
+            else:
+                # Fallback to frame counter if timestamp is before segment start
+                av_frame.pts = self._video_frame_count
+            
             self._video_frame_count += 1
             
             try:
@@ -479,9 +487,13 @@ class Procturing:
             
             in_frame = av.AudioFrame.from_ndarray(arr, format="s16", layout=layout)
             in_frame.sample_rate = int(sample_rate)
-            in_frame.pts = self._audio_sample_count
+            # Use sample counter for PTS (monotonically increasing) - more reliable with resampling
+            # Store base sample count before increment for PTS calculation
+            base_sample_count = self._audio_sample_count
+            in_frame.pts = base_sample_count
             in_frame.time_base = Fraction(1, int(sample_rate))
             
+            # Increment counter AFTER setting PTS
             self._audio_sample_count += num_samples
 
             if needs_resample and self._audio_resampler is not None:
@@ -503,9 +515,23 @@ class Procturing:
                         out_frames = [in_frame]
 
             for out in out_frames:
-                base_sample_count = self._audio_sample_count - num_samples
-                audio_pts_samples = int((base_sample_count * target_sample_rate) / int(sample_rate))
+                # Check if resampler set its own PTS
+                if hasattr(out, 'pts') and out.pts is not None and out.pts >= 0:
+                    # Resampler may have set PTS, but we need to convert to target rate
+                    # Get the resampler's PTS if it exists
+                    resampler_pts = out.pts
+                    # Convert from input rate timebase to target rate
+                    if resampler_pts > 0:
+                        # Convert resampler PTS (at input rate) to target rate
+                        audio_pts_samples = int((resampler_pts * target_sample_rate) / int(sample_rate))
+                    else:
+                        # Fallback to our calculation
+                        audio_pts_samples = int((base_sample_count * target_sample_rate) / int(sample_rate))
+                else:
+                    # Use our calculation
+                    audio_pts_samples = int((base_sample_count * target_sample_rate) / int(sample_rate))
                 
+                # Ensure non-negative
                 if audio_pts_samples < 0:
                     audio_pts_samples = 0
                     
@@ -520,10 +546,18 @@ class Procturing:
                         if packet.pts is not None and packet.pts < 0:
                             print(f"[WARNING] Skipping packet with negative PTS: {packet.pts}")
                             continue
+                        # Validate packet before muxing
+                        if packet.pts is None:
+                            print(f"[WARNING] Packet has None PTS, skipping")
+                            continue
                         container.mux(packet)
                         self._audio_frames_written += 1
                 except Exception as encode_error:
                     print(f"[ERROR] Failed to encode/mux audio packet: {encode_error}")
+                    print(f"[DEBUG] Frame PTS: {out.pts}, time_base: {out.time_base}, sample_rate: {out.sample_rate}")
+                    print(f"[DEBUG] Base sample count: {base_sample_count}, target rate: {target_sample_rate}, input rate: {sample_rate}")
+                    import traceback
+                    traceback.print_exc()
                     continue
         except Exception as e:
             print(f"[ERROR] Error writing audio frame: {e}")
